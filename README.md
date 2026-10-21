@@ -26,14 +26,17 @@ computer-controlled carriers. The game simply never lets the player switch it on
 
 **CC2 Autopilot** is a tiny desktop panel that flips that switch for *your* carrier:
 
-| Manual | Autopilot | With the optional salvo row |
-|:---:|:---:|:---:|
-| <img src="docs/images/panel_manual.png" width="200"> | <img src="docs/images/panel_auto.png" width="200"> | <img src="docs/images/panel_salvo.png" width="200"> |
+| Manual | Autopilot | Multiplayer host: pick the carrier | With the optional salvo row |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/images/panel_manual.png" width="190"> | <img src="docs/images/panel_auto.png" width="190"> | <img src="docs/images/panel_picker.png" width="190"> | <img src="docs/images/panel_salvo.png" width="190"> |
 
 - **AUTO** — the carrier follows the waypoints you placed on the map, in order, and **stops at the last one**.
 - **MANUAL** — the helm is yours again, exactly as in the vanilla game.
 - Works with **any save, any game state** — the panel finds your carrier by itself after every launch and load.
 - Starts and closes **together with the game** if you add one line to Steam launch options.
+- **Multiplayer (host):** if your team has several carriers, pick the one you want with **◄ ►** at the top
+  of the panel — *CARRIER 2 · T1* is carrier no. 2 of team 1 (the same number the *Revolution* mod shows
+  in brackets on its pause-menu map).
 - *(Optional, off by default)* **Main gun salvo 1–5** — how many shells the carrier main gun fires per
   support-fire request (vanilla is 5). Single-player only, see [Fair play](#fair-play).
 
@@ -56,6 +59,7 @@ Requirements: Windows 10/11 (64-bit) with .NET Framework 4.x (already part of Wi
 
 1. Start the game and load any save.
 2. Open the map and place waypoints for your **carrier** as usual.
+   In multiplayer with several player carriers, first choose the carrier with **◄ ►** on the panel.
 3. Make sure the **steering lock** and **side thrusters** are off and the engine is running.
 4. Click the big button on the panel → the lamp turns **green, AUTO**. The carrier sails the route.
 5. Click again → **MANUAL**, the helm is yours.
@@ -87,6 +91,9 @@ For the curious (and for the sceptical):
 - Even single-player CC2 runs a server and a client in one process. The panel finds the **server-side**
   vehicle object (the one the simulation uses) using the field layout from the game's own save code,
   checks the class pointer, vehicle id and team, and writes one integer. That's the whole trick.
+- In multiplayer the server runs only in the **host's** game. That's why the panel works for the host
+  (for any carrier of any team) and cannot work for clients: a client's game has no server objects, and
+  there is no game command a client could send to switch the mode.
 - The Lua modding API can only *read* the control mode, which is why this is a small external program and
   not a Steam Workshop mod.
 - The salvo option changes the in-memory value of `turret_carrier_main_gun_salvo_count`, a constant
@@ -94,8 +101,9 @@ For the curious (and for the sceptical):
 
 **Safety rules built into the panel**
 
-- It never writes unless it finds exactly one matching object for your carrier (class pointer + vehicle id + team).
-- If several human carriers are in manual mode (for example you host a multiplayer game), it refuses to act.
+- It never writes unless it finds the server object of the selected carrier (class pointer + vehicle id + team).
+- If several player carriers are in manual mode (multiplayer host), it does nothing until you pick one
+  with ◄ ► in this session — a carrier remembered from an earlier game is never switched silently.
 - It only touches your carrier's control mode and, if you enable it, the salvo constant. Nothing else.
 
 ## Fair play
@@ -103,13 +111,14 @@ For the curious (and for the sceptical):
 - The **autopilot** does not change combat — it only steers.
 - The **salvo** option does change combat, so it is **off by default** and labelled *single-player only*.
   Please don't use it against other people without their agreement.
-- Multiplayer has not been tested. Most likely only the host's changes take effect.
+- In multiplayer only the host can use it. As the host, please switch other players' carriers only when they ask you to.
 
 ## Compatibility
 
 Tested with Carrier Command 2 Steam build `23836745` (`carrier_command.exe`, 11 353 600 bytes,
 PE timestamp 2026-06-20). Works alongside the *Revolution* overhaul mod. A game update may move things
-in memory; in that case the panel simply says *“carrier object not found”* and writes nothing.
+in memory; in that case the panel simply says *“no carriers — not the host?”* and writes nothing.
+Multiplayer tested as the host with two carriers in one team.
 
 ## Build from source
 
@@ -136,6 +145,11 @@ thrusters are off. Then click the panel once more — it re-scans memory on ever
 
 **Is this a Workshop mod?** No. Workshop mods are Lua and data files, and Lua cannot switch the control mode.
 
+**Multiplayer: the panel says “no carriers — not the host?”.** This usually means you joined someone
+else's game. The autopilot lives on the host's machine — ask the host to run CC2 Autopilot and switch
+your carrier. If you are the host, check that a game is loaded; an unsupported game update can also
+prevent the panel from finding the carrier.
+
 **Will I get banned?** CC2 has no anti-cheat that we know of, and the autopilot gives no combat
 advantage. Still, use it at your own risk.
 
@@ -156,6 +170,9 @@ respective owners. Provided “as is”, without warranty — see [LICENSE](LICE
 - **AUTO** — авианосец идёт по точкам маршрута, поставленным на карте, по порядку и **останавливается на последней**;
 - **MANUAL** — штурвал снова ваш, как в обычной игре;
 - работает с любым сохранением и в любом состоянии игры — панель сама находит авианосец;
+- **сетевая игра (хост):** если в команде несколько авианосцев, выберите нужный стрелками ◄ ► вверху
+  панели — *CARRIER 2 · T1* значит авианосец №2 команды 1 (тот же номер Revolution пишет в скобках на
+  карте в меню паузы). Клиент (не хост) включить автопилот не может: сервер игры работает у хоста;
 - *(по желанию, выключено по умолчанию)* **залп главного калибра 1–5** — сколько выстрелов делает пушка
   авианосца по запросу огня поддержки (в игре 5). Только для одиночной игры.
 

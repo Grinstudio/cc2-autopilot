@@ -120,9 +120,10 @@ static class GameMemory
 
     // Server-side vehicle object (offsets taken from the game's own save serializer):
     //   +0x08 team id, +0x80 vehicle id (also at +0x108 / +0x19C), +0x180 hitpoints,
-    //   +0x188 preferred_bay_index (255), +0x18C special_id (0),
-    //   +0x1D0 control_mode (1 manual, 0 auto). Writing the client copies does nothing: the server
-    //   object is the one the simulation uses.
+    //   +0x188 preferred_bay_index (255), +0x18C special_id (0 in single-player; the carrier's number
+    //   inside its team in multiplayer: 1, 2, ...), +0x1D0 control_mode (1 manual, 0 auto).
+    //   Writing the client copies does nothing: the server object is the one the simulation uses,
+    //   and it exists only in the host's game.
     public const int SrvTeam = 0x08, SrvId = 0x80, SrvHp = 0x180, SrvBay = 0x188, SrvSpecial = 0x18C, SrvMode = 0x1D0, SrvSize = 0x230;
 
     // First field of the server vehicle object = class pointer (vtable) inside carrier_command.exe:
@@ -134,9 +135,17 @@ static class GameMemory
         return (uint)(game.MainModule.BaseAddress.ToInt64() + VtableRva);
     }
 
-    public static List<long> FindServerObjects(IntPtr h, int vehicleId, int teamId, uint vtable)
+    public class CarrierObject
     {
-        var result = new List<long>();
+        public long Address;
+        public int Id, Team, Number, Mode;
+        public string Label { get { return "T" + Team + "·" + Number; } }
+    }
+
+    // All server-side carrier objects (AI carriers included; they are in auto mode).
+    public static List<CarrierObject> FindCarriers(IntPtr h, uint vtable)
+    {
+        var result = new List<CarrierObject>();
         long addr = 0;
         Native.MEMORY_BASIC_INFORMATION mbi;
         IntPtr mbiSize = (IntPtr)Marshal.SizeOf(typeof(Native.MEMORY_BASIC_INFORMATION));
@@ -158,18 +167,28 @@ static class GameMemory
                     {
                         if (BitConverter.ToUInt32(d, i) != vtable) continue;
                         if (d[i + SrvBay] != 255) continue;
-                        if (BitConverter.ToInt32(d, i + SrvId) != vehicleId) continue;
-                        if (BitConverter.ToInt32(d, i + SrvTeam) != teamId) continue;
-                        if (BitConverter.ToInt32(d, i + SrvSpecial) != 0) continue;
+                        int special = BitConverter.ToInt32(d, i + SrvSpecial);
                         int mode = BitConverter.ToInt32(d, i + SrvMode);
                         int hp = BitConverter.ToInt32(d, i + SrvHp);
-                        if (mode < 0 || mode > 3 || hp <= 0 || hp > 100000) continue;
-                        result.Add(baseAddr + off + i);
+                        int id = BitConverter.ToInt32(d, i + SrvId);
+                        int team = BitConverter.ToInt32(d, i + SrvTeam);
+                        if (special < 0 || special > 16 || mode < 0 || mode > 3 || hp <= 0 || hp > 100000) continue;
+                        if (id <= 0 || id > 1000000 || team < 0 || team > 64) continue;
+                        result.Add(new CarrierObject { Address = baseAddr + off + i, Id = id, Team = team,
+                            Number = special, Mode = mode });
                     }
                 }
             }
             addr = baseAddr + size;
         }
+        return result;
+    }
+
+    public static List<long> FindServerObjects(IntPtr h, int vehicleId, int teamId, uint vtable)
+    {
+        var result = new List<long>();
+        foreach (var c in FindCarriers(h, vtable))
+            if (c.Id == vehicleId && c.Team == teamId) result.Add(c.Address);
         return result;
     }
 
@@ -285,13 +304,19 @@ class AutopilotForm : Form
     Rectangle[] salvoRects = new Rectangle[5];
     string salvoStatus = "";
     bool showSalvo;               // off by default: changes combat, single-player only
-    const int HeightCompact = 170, HeightWithSalvo = 222;
+    const int HeightCompact = 196, HeightWithSalvo = 248;
+    // carrier picker: shown when several player carriers (manual mode) exist, e.g. multiplayer host
+    List<GameMemory.CarrierObject> pickerItems = new List<GameMemory.CarrierObject>();
+    bool pickedThisSession;
+    int salvoLabelY;
     const int ModeAuto = 0, ModeManual = 1;
     bool isOn;
     string status = L.T("нажмите, чтобы включить", "click to engage");
     int myVehicleId = -1, myTeamId = -1;
     List<long> myObjects = new List<long>();
-    Rectangle buttonRect = new Rectangle(20, 34, 180, 92);
+    Rectangle buttonRect = new Rectangle(20, 60, 180, 92);
+    // carrier selector at the top: ◄ CARRIER 1 · T1 ►
+    Rectangle prevRect = new Rectangle(14, 30, 26, 24), nextRect = new Rectangle(180, 30, 26, 24);
     Point dragStart;
     bool dragging;
     readonly Timer pollTimer = new Timer();
@@ -328,10 +353,51 @@ class AutopilotForm : Form
         pollTimer.Start();
     }
 
-    void ApplySalvoVisibility()
+    void ApplySalvoVisibility() { Relayout(); }
+
+    // Rows under the main button: carrier picker (only when needed), then the optional salvo row.
+    void Relayout()
     {
-        Size = new Size(220, showSalvo ? HeightWithSalvo : HeightCompact);
+        int y = 184;
+        if (showSalvo)
+        {
+            salvoLabelY = y + 2;
+            for (int k = 0; k < 5; k++) salvoRects[k] = new Rectangle(20 + k * 37, y + 20, 32, 32);
+            y += 58;
+        }
+        Size = new Size(220, Math.Max(HeightCompact, y + 8));
         Invalidate();
+    }
+
+    GameMemory.CarrierObject SelectedItem()
+    {
+        return pickedThisSession || pickerItems.Count == 1 ? pickerItems.Find(IsSelected) ?? (pickerItems.Count == 1 ? pickerItems[0] : null) : null;
+    }
+
+    string SelectorText()
+    {
+        var c = SelectedItem();
+        if (c == null)
+            return pickerItems.Count > 1 ? L.T("◄ выберите авианосец ►", "◄ choose carrier ►") : "—";
+        string name = c.Number > 0 ? L.T("АВИАНОСЕЦ ", "CARRIER ") + c.Number : L.T("АВИАНОСЕЦ", "CARRIER");
+        return name + " · T" + c.Team;
+    }
+
+    void StepCarrier(int dir)
+    {
+        if (pickerItems.Count == 0) return;
+        int idx = pickerItems.FindIndex(IsSelected);
+        if (!pickedThisSession && pickerItems.Count > 1) idx = dir > 0 ? -1 : 0;
+        idx = ((idx + dir) % pickerItems.Count + pickerItems.Count) % pickerItems.Count;
+        PickCarrier(pickerItems[idx]);
+    }
+
+    bool IsSelected(GameMemory.CarrierObject c) { return c.Id == myVehicleId && c.Team == myTeamId; }
+
+    // Our candidates: carriers in manual mode (human-driven) plus the one we already selected.
+    List<GameMemory.CarrierObject> Candidates(List<GameMemory.CarrierObject> all)
+    {
+        return all.FindAll(c => c.Mode == ModeManual || IsSelected(c));
     }
 
     void LoadState()
@@ -377,26 +443,30 @@ class AutopilotForm : Form
         if (h == IntPtr.Zero) { Cursor = Cursors.Default; Invalidate(); return; }
         try
         {
-            // the client record tells which vehicle id is our carrier (ours = manual, AI = auto)
-            List<CarrierRecord> clients = GameMemory.Scan(h);
-            var mine = clients.FindAll(r => r.Mode == ModeManual);
-            var distinct = new HashSet<long>();
-            foreach (var r in mine) distinct.Add(((long)r.VehicleId << 8) | (uint)r.TeamId);
-            if (distinct.Count > 1)
+            List<GameMemory.CarrierObject> all = GameMemory.FindCarriers(h, GameMemory.ExpectedVtable(GameMemory.FindGame()));
+            if (all.Count == 0)
             {
-                // several human carriers in manual mode (multiplayer host): refuse instead of guessing
-                status = L.T("несколько авианосцев игроков — не трогаю", "several player carriers — not touching");
+                // the server objects live only in the host's game
+                status = L.T("нет авианосцев — вы не хост?", "no carriers — not the host?");
                 return;
             }
-            if (mine.Count == 0 && myVehicleId > 0)
-                mine = clients.FindAll(r => r.VehicleId == myVehicleId && r.TeamId == myTeamId);
-            if (mine.Count == 0) { status = L.T("авианосец не найден", "carrier not found"); return; }
-            myVehicleId = mine[0].VehicleId;
-            myTeamId = mine[0].TeamId;
+            var cand = Candidates(all);
+            pickerItems = cand;
+            Relayout();
+            // with several player carriers a remembered selection from an earlier game is not enough:
+            // the player must pick explicitly in this session
+            var selected = cand.Count > 1 && !pickedThisSession ? null : cand.Find(IsSelected);
+            if (selected == null && cand.Count == 1) selected = cand[0];
+            if (selected == null)
+            {
+                status = cand.Count > 1 ? L.T("выберите свой авианосец ниже", "pick your carrier below")
+                                        : L.T("авианосец не найден", "carrier not found");
+                return;
+            }
+            myVehicleId = selected.Id;
+            myTeamId = selected.Team;
             SaveState();
-
-            myObjects = GameMemory.FindServerObjects(h, myVehicleId, myTeamId, GameMemory.ExpectedVtable(GameMemory.FindGame()));
-            if (myObjects.Count == 0) { status = L.T("объект авианосца не найден", "carrier object not found"); return; }
+            myObjects = new List<long> { selected.Address };
             int current = GameMemory.ReadServerMode(h, myObjects[0]);
             int target = current == ModeAuto ? ModeManual : ModeAuto;
             int ok = 0;
@@ -433,23 +503,22 @@ class AutopilotForm : Form
 
     void StartBackgroundLookup()
     {
-        if (lookupRunning || myVehicleId <= 0 || (DateTime.Now - lastLookup).TotalSeconds < 15) return;
+        if (lookupRunning || (DateTime.Now - lastLookup).TotalSeconds < 15) return;
         if (myObjects.Count > 0 && (salvoAddr >= 0 || !showSalvo)) return;
         Process game = GameMemory.FindGame();
         if (game == null) return;
         lookupRunning = true;
         lastLookup = DateTime.Now;
-        int id = myVehicleId, team = myTeamId;
         System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
-            List<long> objs = new List<long>();
+            List<GameMemory.CarrierObject> carriers = new List<GameMemory.CarrierObject>();
             long sAddr = -1; bool sFloat = false;
             IntPtr h = Native.OpenProcess(Native.PROCESS_VM_READ | Native.PROCESS_QUERY_INFORMATION, false, game.Id);
             if (h != IntPtr.Zero)
             {
                 try
                 {
-                    objs = GameMemory.FindServerObjects(h, id, team, GameMemory.ExpectedVtable(game));
+                    carriers = GameMemory.FindCarriers(h, GameMemory.ExpectedVtable(game));
                     if (showSalvo) sAddr = SalvoMemory.Find(h, out sFloat);
                 }
                 catch { }
@@ -459,7 +528,19 @@ class AutopilotForm : Form
             {
                 BeginInvoke((MethodInvoker)delegate
                 {
-                    if (myObjects.Count == 0 && objs.Count > 0) { myObjects = objs; status = L.T("авианосец найден", "carrier found"); }
+                    if (myObjects.Count == 0 && carriers.Count > 0)
+                    {
+                        var cand = Candidates(carriers);
+                        pickerItems = cand;
+                        Relayout();
+                        var sel = cand.Count == 1 ? cand[0] : (pickedThisSession ? cand.Find(IsSelected) : null);
+                        if (sel != null)
+                        {
+                            myObjects = new List<long> { sel.Address };
+                            status = L.T("авианосец найден", "carrier found");
+                        }
+                        else if (cand.Count > 1) status = L.T("выберите свой авианосец ниже", "pick your carrier below");
+                    }
                     if (salvoAddr < 0 && sAddr >= 0) { salvoAddr = sAddr; salvoIsFloat = sFloat; }
                     lookupRunning = false;
                     Invalidate();
@@ -538,14 +619,36 @@ class AutopilotForm : Form
         using (var b = new SolidBrush(isOn ? Color.FromArgb(120, 230, 140) : Color.FromArgb(170, 175, 180)))
         {
             var fmt = new StringFormat { Alignment = StringAlignment.Center };
-            g.DrawString(status, font, b, new RectangleF(0, 136, Width, 20), fmt);
+            g.DrawString(status, font, b, new RectangleF(0, 162, Width, 20), fmt);
+        }
+
+        // carrier selector row
+        bool canStep = pickerItems.Count > 1;
+        foreach (var r in new[] { prevRect, nextRect })
+        {
+            using (var body = new SolidBrush(canStep ? Color.FromArgb(62, 67, 72) : Color.FromArgb(45, 49, 53)))
+                g.FillRectangle(body, r);
+            using (var pen = new Pen(Color.FromArgb(20, 22, 24), 2)) g.DrawRectangle(pen, r);
+        }
+        using (var font = new Font("Consolas", 9f, FontStyle.Bold))
+        using (var ab = new SolidBrush(canStep ? Color.FromArgb(220, 225, 230) : Color.FromArgb(90, 95, 100)))
+        {
+            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString("◄", font, ab, prevRect, fmt);
+            g.DrawString("►", font, ab, nextRect, fmt);
+        }
+        using (var font = new Font("Consolas", 8.5f, FontStyle.Bold))
+        using (var tb = new SolidBrush(SelectedItem() != null ? Color.FromArgb(120, 230, 140) : Color.FromArgb(200, 205, 210)))
+        {
+            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString(SelectorText(), font, tb, new RectangleF(prevRect.Right, prevRect.Y, nextRect.X - prevRect.Right, prevRect.Height), fmt);
         }
 
         // salvo selector (opt-in)
         if (!showSalvo) return;
         using (var font = new Font("Consolas", 8.5f, FontStyle.Bold))
         using (var b = new SolidBrush(Color.FromArgb(170, 175, 180)))
-            g.DrawString("CRR GUN SALVO" + (salvoStatus != "" ? "  " + salvoStatus : ""), font, b, 18, 160);
+            g.DrawString("CRR GUN SALVO" + (salvoStatus != "" ? "  " + salvoStatus : ""), font, b, 18, salvoLabelY);
         for (int k = 0; k < 5; k++)
         {
             Rectangle r = salvoRects[k];
@@ -563,6 +666,19 @@ class AutopilotForm : Form
                 g.DrawString((k + 1).ToString(), font, tb, new RectangleF(r.X, r.Y + 11, r.Width, 18), fmt);
             }
         }
+    }
+
+    // Selecting a carrier only selects it; the big button then switches that carrier.
+    void PickCarrier(GameMemory.CarrierObject c)
+    {
+        myVehicleId = c.Id;
+        myTeamId = c.Team;
+        pickedThisSession = true;
+        SaveState();
+        myObjects = new List<long> { c.Address };
+        isOn = c.Mode == ModeAuto;
+        status = L.T("выбран ", "selected ") + c.Label + (isOn ? " — AUTO" : " — MANUAL");
+        Invalidate();
     }
 
     void SetSalvo(int value)
@@ -595,6 +711,8 @@ class AutopilotForm : Form
         if (e.Button != MouseButtons.Left) return;
         if (e.X > Width - 24 && e.Y < 24) { Close(); return; }
         if (buttonRect.Contains(e.Location)) { Toggle(); return; }
+        if (prevRect.Contains(e.Location)) { StepCarrier(-1); return; }
+        if (nextRect.Contains(e.Location)) { StepCarrier(1); return; }
         if (showSalvo)
             for (int k = 0; k < 5; k++) if (salvoRects[k].Contains(e.Location)) { SetSalvo(k + 1); return; }
         dragging = true;
@@ -615,6 +733,17 @@ class AutopilotForm : Form
         ApplySalvoVisibility();
     }
 
+    public void SetPickerPreview(bool ru)
+    {
+        pickerItems = new List<GameMemory.CarrierObject> {
+            new GameMemory.CarrierObject { Id = 2, Team = 1, Number = 1, Mode = 1 },
+            new GameMemory.CarrierObject { Id = 21, Team = 1, Number = 2, Mode = 0 } };
+        myVehicleId = 21; myTeamId = 1; pickedThisSession = true;
+        isOn = true; showSalvo = false;
+        status = ru ? "АВТОПИЛОТ" : "AUTOPILOT";
+        Relayout();
+    }
+
     [STAThread]
     static void Main(string[] args)
     {
@@ -624,6 +753,7 @@ class AutopilotForm : Form
             bool ru = args.Length > 3 && args[3] == "ru";
             if (args[2] == "manual") f.SetPreview(false, false, 0, ru ? "ручное управление" : "manual control");
             else if (args[2] == "auto") f.SetPreview(true, false, 0, ru ? "АВТОПИЛОТ" : "AUTOPILOT");
+            else if (args[2] == "picker") f.SetPickerPreview(ru);
             else f.SetPreview(true, true, 3, ru ? "АВТОПИЛОТ" : "AUTOPILOT");
             using (var bmp = new Bitmap(f.Width, f.Height))
             {
@@ -648,9 +778,8 @@ class AutopilotForm : Form
                     lines.Add("client 0x" + r.Address.ToString("x") + " id " + r.VehicleId + " team " + r.TeamId + " mode " + r.Mode);
                     ids[r.VehicleId] = r.TeamId;
                 }
-                foreach (var kv in ids)
-                    foreach (long obj in GameMemory.FindServerObjects(h, kv.Key, kv.Value, GameMemory.ExpectedVtable(p)))
-                        lines.Add("server 0x" + obj.ToString("x") + " id " + kv.Key + " team " + kv.Value + " mode " + GameMemory.ReadServerMode(h, obj));
+                foreach (var c in GameMemory.FindCarriers(h, GameMemory.ExpectedVtable(p)))
+                    lines.Add("server 0x" + c.Address.ToString("x") + " id " + c.Id + " team " + c.Team + " number " + c.Number + " mode " + c.Mode);
                 bool sf; long sa = SalvoMemory.Find(h, out sf);
                 lines.Add(sa < 0 ? "salvo constant not found" : "salvo 0x" + sa.ToString("x") + (sf ? " float " : " int ") + SalvoMemory.Read(h, sa, sf));
                 Native.CloseHandle(h);
