@@ -115,9 +115,11 @@ For the curious (and for the sceptical):
 
 ## Compatibility
 
-Tested with Carrier Command 2 Steam build `23836745` (`carrier_command.exe`, 11 353 600 bytes,
-PE timestamp 2026-06-20). Works alongside the *Revolution* overhaul mod. A game update may move things
-in memory; in that case the panel simply says *“no carriers — not the host?”* and writes nothing.
+Tested with Carrier Command 2 Steam builds `23836745` and `26277078` (October 2026 update). Works
+alongside the *Revolution* overhaul mod. Game updates move the carrier class in memory; the panel
+re-discovers it by itself (it matches the carriers the game client lists by id and team) and only
+uses it if all matches agree. If it still can't find anything, it says *“no carriers — not the
+host?”* and writes nothing.
 Multiplayer tested as the host with two carriers in one team.
 
 ## Build from source

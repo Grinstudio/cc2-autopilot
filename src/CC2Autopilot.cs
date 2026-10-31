@@ -126,13 +126,79 @@ static class GameMemory
     //   and it exists only in the host's game.
     public const int SrvTeam = 0x08, SrvId = 0x80, SrvHp = 0x180, SrvBay = 0x188, SrvSpecial = 0x18C, SrvMode = 0x1D0, SrvSize = 0x230;
 
-    // First field of the server vehicle object = class pointer (vtable) inside carrier_command.exe:
-    // RVA 0x9596CC (seen as 0xA796CC with the module loaded at 0x120000). Computed from the real module base.
-    public const long VtableRva = 0x9596CC;
+    // First field of the server carrier object = class pointer (vtable) inside carrier_command.exe.
+    // Known RVAs per game build: 0x9596CC (build 23836745), 0x9596EC (build 26277078). A game update
+    // can move it; then it is re-discovered from the carriers the client records name (id + team) and
+    // cached for the running process.
+    static readonly long[] KnownVtableRvas = { 0x9596EC, 0x9596CC };
+    static int cachedPid = -1;
+    static uint cachedVtable;
 
     public static uint ExpectedVtable(Process game)
     {
-        return (uint)(game.MainModule.BaseAddress.ToInt64() + VtableRva);
+        if (game == null) return 0;
+        if (game.Id == cachedPid) return cachedVtable;
+        IntPtr h = Native.OpenProcess(Native.PROCESS_VM_READ | Native.PROCESS_QUERY_INFORMATION, false, game.Id);
+        if (h == IntPtr.Zero) return 0;
+        try
+        {
+            long moduleBase = game.MainModule.BaseAddress.ToInt64();
+            long moduleEnd = moduleBase + game.MainModule.ModuleMemorySize;
+            foreach (long rva in KnownVtableRvas)
+            {
+                uint vt = (uint)(moduleBase + rva);
+                if (FindCarriers(h, vt).Count > 0) { cachedPid = game.Id; cachedVtable = vt; return vt; }
+            }
+            uint found = DiscoverVtable(h, moduleBase, moduleEnd);
+            if (found != 0) { cachedPid = game.Id; cachedVtable = found; }
+            return found;
+        }
+        finally { Native.CloseHandle(h); }
+    }
+
+    // Objects whose id + team match a carrier from the client records and whose fields sit where the
+    // save serializer puts them; their first field is the carrier class pointer. All matches must agree.
+    static uint DiscoverVtable(IntPtr h, long moduleBase, long moduleEnd)
+    {
+        var known = new HashSet<long>();
+        foreach (var r in Scan(h)) known.Add(((long)r.VehicleId << 8) | (uint)r.TeamId);
+        if (known.Count == 0) return 0;
+        var votes = new Dictionary<uint, int>();
+        long addr = 0;
+        Native.MEMORY_BASIC_INFORMATION mbi;
+        IntPtr mbiSize = (IntPtr)Marshal.SizeOf(typeof(Native.MEMORY_BASIC_INFORMATION));
+        const int Chunk = 16 << 20;
+        while (addr < 0x7FFFFFFFFFFF && Native.VirtualQueryEx(h, (IntPtr)addr, out mbi, mbiSize) != IntPtr.Zero)
+        {
+            long baseAddr = mbi.BaseAddress.ToInt64(), size = mbi.RegionSize.ToInt64();
+            if (mbi.State == Native.MEM_COMMIT && mbi.Type == Native.MEM_PRIVATE && mbi.Protect == Native.PAGE_READWRITE)
+            {
+                for (long off = 0; off < size; off += Chunk)
+                {
+                    int len = (int)Math.Min(Chunk + SrvSize, size - off);
+                    byte[] d = new byte[len];
+                    IntPtr read;
+                    if (!Native.ReadProcessMemory(h, (IntPtr)(baseAddr + off), d, (IntPtr)len, out read)) continue;
+                    int last = Math.Min((int)read - SrvSize, Chunk);
+                    for (int i = 0; i < last; i += 4)
+                    {
+                        if (d[i + SrvBay] != 255) continue;
+                        uint vt = BitConverter.ToUInt32(d, i);
+                        if (vt < moduleBase || vt >= moduleEnd) continue;
+                        int id = BitConverter.ToInt32(d, i + SrvId), team = BitConverter.ToInt32(d, i + SrvTeam);
+                        if (!known.Contains(((long)id << 8) | (uint)team)) continue;
+                        int special = BitConverter.ToInt32(d, i + SrvSpecial), mode = BitConverter.ToInt32(d, i + SrvMode);
+                        int hp = BitConverter.ToInt32(d, i + SrvHp);
+                        if (special < 0 || special > 16 || mode < 0 || mode > 3 || hp <= 0 || hp > 100000) continue;
+                        int n; votes.TryGetValue(vt, out n); votes[vt] = n + 1;
+                    }
+                }
+            }
+            addr = baseAddr + size;
+        }
+        if (votes.Count != 1) return 0;   // nothing found or ambiguous -> do nothing
+        foreach (uint vt in votes.Keys) return vt;
+        return 0;
     }
 
     public class CarrierObject
